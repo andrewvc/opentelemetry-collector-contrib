@@ -56,3 +56,23 @@ func Test_traceID_validation(t *testing.T) {
 		})
 	}
 }
+
+func BenchmarkTraceID(b *testing.B) {
+	// Benchmark the original implementation with 16-byte input
+	b.Run("bytes", func(b *testing.B) {
+		bytes := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+		expr, err := traceID[any](bytes)
+		if err != nil {
+			b.Fatal(err)
+		}
+		ctx := b.Context()
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			_, err := expr(ctx, nil)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
