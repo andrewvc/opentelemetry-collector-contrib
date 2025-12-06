@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 )
 
 func Test_traceID(t *testing.T) {
@@ -58,21 +59,28 @@ func Test_traceID_validation(t *testing.T) {
 }
 
 func BenchmarkTraceID(b *testing.B) {
-	// Benchmark the original implementation with 16-byte input
-	b.Run("bytes", func(b *testing.B) {
+	// Benchmark with get and set - realistic usage where we get the TraceID
+	// from the expression and set it on a span
+	b.Run("get_and_set", func(b *testing.B) {
 		bytes := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 		expr, err := traceID[any](bytes)
 		if err != nil {
 			b.Fatal(err)
 		}
+
+		// Create a span to set the trace ID on
+		traces := ptrace.NewTraces()
+		span := traces.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+
 		ctx := b.Context()
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
-			_, err := expr(ctx, nil)
+			result, err := expr(ctx, nil)
 			if err != nil {
 				b.Fatal(err)
 			}
+			span.SetTraceID(result.(pcommon.TraceID))
 		}
 	})
 }
