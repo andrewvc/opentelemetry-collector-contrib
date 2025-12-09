@@ -4,6 +4,8 @@
 package ottlfuncs
 
 import (
+	"context"
+	"encoding/hex"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -83,4 +85,73 @@ func BenchmarkTraceID(b *testing.B) {
 			span.SetTraceID(result.(pcommon.TraceID))
 		}
 	})
+
+	// Benchmark simulating dynamic trace ID setting via:
+	// set(span.trace_id.string, Substring(Hex(cache["new_sha"]), 0, 32))
+	// This doesn't use the TraceID function, but rather Hex + Substring + TraceID parsing
+	b.Run("dynamic_hex_substring_set", func(b *testing.B) {
+		// Simulate cache["new_sha"] - a 20 byte SHA1 hash
+		shaBytes := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+
+		// Create getters to simulate the OTTL expression
+		byteGetter := &mockByteGetter{value: shaBytes}
+		hexExpr, err := Hex[any](byteGetter)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		stringGetter := &mockStringExprGetter{expr: hexExpr}
+		startGetter := &mockIntGetter{value: 0}
+		lengthGetter := &mockIntGetter{value: 32}
+		substringExpr := substring[any](stringGetter, startGetter, lengthGetter)
+
+		// Create a span to set the trace ID on
+		traces := ptrace.NewTraces()
+		span := traces.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+
+		ctx := b.Context()
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			result, err := substringExpr(ctx, nil)
+			if err != nil {
+				b.Fatal(err)
+			}
+			hexString := result.(string)
+			var traceID pcommon.TraceID
+			if _, err := hex.Decode(traceID[:], []byte(hexString)); err != nil {
+				b.Fatal(err)
+			}
+			span.SetTraceID(traceID)
+		}
+	})
+}
+
+// Mock getters for benchmark simulation
+type mockByteGetter struct {
+	value []byte
+}
+
+func (m *mockByteGetter) Get(context.Context, any) ([]byte, error) {
+	return m.value, nil
+}
+
+type mockStringExprGetter struct {
+	expr func(context.Context, any) (any, error)
+}
+
+func (m *mockStringExprGetter) Get(ctx context.Context, tCtx any) (string, error) {
+	result, err := m.expr(ctx, tCtx)
+	if err != nil {
+		return "", err
+	}
+	return result.(string), nil
+}
+
+type mockIntGetter struct {
+	value int64
+}
+
+func (m *mockIntGetter) Get(context.Context, any) (int64, error) {
+	return m.value, nil
 }
