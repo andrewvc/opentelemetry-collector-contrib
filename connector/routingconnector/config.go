@@ -6,7 +6,9 @@ package routingconnector // import "github.com/open-telemetry/opentelemetry-coll
 import (
 	"errors"
 	"fmt"
+	"strings"
 
+	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/pipeline"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl"
@@ -43,6 +45,85 @@ type Config struct {
 	_ struct{}
 }
 
+var _ confmap.Unmarshaler = (*Config)(nil)
+
+// Unmarshal implements confmap.Unmarshaler to support string syntax in table entries.
+//
+// We cannot use the default unmarshaler (via type alias pattern) because it would fail
+// when the 'table' field contains string entries. The 'Table' field is typed as
+// []RoutingTableItem, so confmap would attempt to unmarshal strings into that struct type
+// and fail. Instead, we manually unmarshal each field:
+//   - error_mode: unmarshaled as string, then parsed into ErrorMode type
+//   - default_pipelines: unmarshaled as []string, then parsed into []pipeline.ID
+//   - table: custom logic to handle both string syntax and map syntax
+//
+// This approach is more verbose but safer and more explicit than trying to work around
+// confmap's type checking.
+func (cfg *Config) Unmarshal(conf *confmap.Conf) error {
+	// Manually unmarshal error_mode field
+	if errorMode := conf.Get("error_mode"); errorMode != nil {
+		if em, ok := errorMode.(string); ok {
+			if err := cfg.ErrorMode.UnmarshalText([]byte(em)); err != nil {
+				return fmt.Errorf("error_mode: %w", err)
+			}
+		}
+	}
+
+	// Manually unmarshal default_pipelines field
+	if defaultPipelines := conf.Get("default_pipelines"); defaultPipelines != nil {
+		if pipelines, ok := defaultPipelines.([]any); ok {
+			cfg.DefaultPipelines = make([]pipeline.ID, 0, len(pipelines))
+			for i, p := range pipelines {
+				if pStr, ok := p.(string); ok {
+					var pipelineID pipeline.ID
+					if err := pipelineID.UnmarshalText([]byte(pStr)); err != nil {
+						return fmt.Errorf("default_pipelines[%d]: %w", i, err)
+					}
+					cfg.DefaultPipelines = append(cfg.DefaultPipelines, pipelineID)
+				}
+			}
+		}
+	}
+
+	// Manually unmarshal table field with special handling for string syntax
+	// Each entry can be either:
+	//   - A string: "route(["pipeline"]) where condition" (new concise syntax)
+	//   - A map: {statement: "...", pipelines: [...]} (traditional syntax)
+	rawTable := conf.Get("table")
+	if rawTable == nil {
+		return nil
+	}
+
+	tableSlice, ok := rawTable.([]any)
+	if !ok {
+		return nil // Let normal validation handle this
+	}
+
+	cfg.Table = make([]RoutingTableItem, 0, len(tableSlice))
+	for i, entry := range tableSlice {
+		switch e := entry.(type) {
+		case string:
+			// String syntax: store raw, pipelines extracted at router init
+			cfg.Table = append(cfg.Table, RoutingTableItem{
+				Statement: e,   // Store full string: route(["pipes"]) where condition
+				Pipelines: nil, // Will be populated at router init
+			})
+		case map[string]any:
+			// Map syntax: normal unmarshaling
+			var item RoutingTableItem
+			itemConf := confmap.NewFromStringMap(e)
+			if err := itemConf.Unmarshal(&item); err != nil {
+				return fmt.Errorf("table[%d]: %w", i, err)
+			}
+			cfg.Table = append(cfg.Table, item)
+		default:
+			return fmt.Errorf("table[%d]: expected string or map, got %T", i, entry)
+		}
+	}
+
+	return nil
+}
+
 // Validate checks if the processor configuration is valid.
 func (c *Config) Validate() error {
 	// validate that there's at least one item in the table
@@ -59,8 +140,18 @@ func (c *Config) Validate() error {
 		if item.Statement != "" && item.Condition != "" {
 			return errConditionAndStatement
 		}
+		// String syntax with arguments like route(["pipes"]) leaves Pipelines as nil
+		// (to be extracted at router init). We detect this by checking if the statement
+		// starts with route([ (allowing whitespace). All other cases require explicit pipelines.
 		if len(item.Pipelines) == 0 {
-			return errNoPipelines
+			// Check if this is string syntax with route arguments
+			trimmed := strings.TrimSpace(item.Statement)
+			// Look for route([... pattern, allowing whitespace: route( [
+			hasRouteArgs := strings.HasPrefix(trimmed, "route(") &&
+				strings.Contains(strings.SplitN(trimmed, ")", 2)[0], "[")
+			if !hasRouteArgs {
+				return errNoPipelines
+			}
 		}
 
 		switch item.Context {

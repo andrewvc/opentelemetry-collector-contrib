@@ -78,6 +78,54 @@ This makes it immediately clear that you're accessing the resource's attributes,
 - The `request` context requires use of the `condition` setting, and relies on a very limited grammar. Conditions must be in the form of `request["key"] == "value"` or `request["key"] != "value"`. (In the future, this grammar may be expanded to support more complex conditions.)
 - When using context inference without an explicit `context` field, the inferred context must be compatible with the pipeline signal type (e.g., `span` context can only be used in traces pipelines).
 
+### String Syntax
+
+The routing connector supports a concise string-based syntax for defining routing rules as an alternative to the map-based configuration. This syntax combines the pipeline list and routing condition into a single line:
+
+**Format:** `route(["pipeline1", "pipeline2"]) where condition`
+
+- `route([...])`: Specifies the target pipelines as a JSON array of strings
+- `where condition` (optional): Specifies the OTTL condition for routing
+
+**Examples:**
+
+```yaml
+connectors:
+  routing:
+    default_pipelines: [logs/other]
+    table:
+      # String syntax - concise and self-documenting
+      - route(["logs/acme"]) where request["X-Tenant"] == "acme"
+      - route(["logs/prod", "logs/backup"]) where resource.attributes["env"] == "prod"
+      
+      # Without a condition - routes all data to these pipelines
+      - route(["logs/default"])
+      
+      # You can mix string syntax with traditional map syntax
+      - condition: attributes["X-Tenant"] == "globex"
+        pipelines: [logs/globex]
+```
+
+**String syntax features:**
+- Pipeline lists are specified as JSON arrays: `["pipeline1", "pipeline2"]`
+- The `where` clause is optional if you want to route all data
+- Context is automatically inferred from the condition (e.g., `request[...]` → request context, `span.` → span context)
+- The syntax is validated at config load time
+- Fully compatible with the existing map-based syntax - use whichever is clearer for your use case
+
+**Equivalent configurations:**
+
+```yaml
+# Map syntax
+table:
+  - condition: resource.attributes["env"] == "prod"
+    pipelines: [traces/prod]
+
+# String syntax
+table:
+  - route(["traces/prod"]) where resource.attributes["env"] == "prod"
+```
+
 ### Supported [OTTL] functions
 
 - [Standard OTTL Converter Functions](../../pkg/ottl/ottlfuncs/README.md#converters)
@@ -91,6 +139,7 @@ The full list of settings exposed for this connector are documented in [config.g
 - [logs](./testdata/config/logs.yaml)
 - [metrics](./testdata/config/metrics.yaml)
 - [traces](./testdata/config/traces.yaml)
+- [string syntax](./testdata/config/string_syntax.yaml)
 
 ## Examples
 

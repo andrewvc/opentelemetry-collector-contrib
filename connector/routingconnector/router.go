@@ -37,6 +37,7 @@ type router[C any] struct {
 	parserCollection *ottl.ParserCollection[any]
 	defaultConsumer  C
 	logger           *zap.Logger
+	settings         component.TelemetrySettings
 	routes           map[string]routingItem[C]
 	consumerProvider consumerProvider[C]
 	table            []RoutingTableItem
@@ -53,6 +54,7 @@ func newRouter[C any](
 ) (*router[C], error) {
 	r := &router[C]{
 		logger:           settings.Logger,
+		settings:         settings,
 		table:            table,
 		routes:           make(map[string]routingItem[C]),
 		consumerProvider: provider,
@@ -241,8 +243,50 @@ func (r *router[C]) normalizeConditions() {
 	}
 }
 
+// extractPipelinesFromStatement extracts pipeline IDs from string syntax using OTTL parsing.
+// This is used to parse route(["p1", "p2"]) where condition into pipeline IDs.
+func (r *router[C]) extractPipelinesFromStatement(statement string) ([]pipeline.ID, error) {
+	var capturedPipelines []string
+
+	// Create temporary parser with capture
+	funcs := standardFunctionsWithCapture[*ottlresource.TransformContext](&capturedPipelines)
+	parser, err := ottlresource.NewParser(funcs, r.settings, ottlresource.EnablePathContextNames())
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse to trigger capture
+	_, err = parser.ParseStatement(statement)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert captured strings to pipeline.ID
+	pipelines := make([]pipeline.ID, len(capturedPipelines))
+	for i, p := range capturedPipelines {
+		if err := pipelines[i].UnmarshalText([]byte(p)); err != nil {
+			return nil, fmt.Errorf("invalid pipeline %q: %w", p, err)
+		}
+	}
+
+	return pipelines, nil
+}
+
 // registerRouteConsumers registers a consumer for the pipelines configured for each route
 func (r *router[C]) registerRouteConsumers() (err error) {
+	for i := range r.table {
+		item := &r.table[i]
+
+		// Extract pipelines from string syntax if needed
+		if len(item.Pipelines) == 0 && strings.HasPrefix(item.Statement, "route([") {
+			pipelines, err := r.extractPipelinesFromStatement(item.Statement)
+			if err != nil {
+				return fmt.Errorf("invalid route syntax in table[%d]: %w", i, err)
+			}
+			item.Pipelines = pipelines
+		}
+	}
+
 	for _, item := range r.table {
 		route, dupeFound := r.routes[key(item)]
 		if dupeFound {

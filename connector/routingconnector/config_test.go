@@ -99,6 +99,36 @@ func TestLoadConfig(t *testing.T) {
 				},
 			},
 		},
+		{
+			configPath: filepath.Join("testdata", "config", "string_syntax.yaml"),
+			id:         component.NewIDWithName(metadata.Type, ""),
+			expected: &Config{
+				DefaultPipelines: []pipeline.ID{
+					pipeline.NewIDWithName(pipeline.SignalTraces, "other"),
+				},
+				ErrorMode: ottl.PropagateError,
+				Table: []RoutingTableItem{
+					{
+						Statement: `route(["traces/acme"]) where attributes["X-Tenant"] == "acme"`,
+						Pipelines: nil, // Pipelines extracted at router init
+					},
+					{
+						Statement: `route(["traces/prod", "traces/backup"]) where resource.attributes["env"] == "prod"`,
+						Pipelines: nil, // Pipelines extracted at router init
+					},
+					{
+						Statement: `route(["traces/default"])`,
+						Pipelines: nil, // Pipelines extracted at router init
+					},
+					{
+						Statement: `route() where attributes["X-Tenant"] == "globex"`,
+						Pipelines: []pipeline.ID{
+							pipeline.NewIDWithName(pipeline.SignalTraces, "globex"),
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range testcases {
