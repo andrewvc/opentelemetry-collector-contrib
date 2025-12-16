@@ -140,16 +140,18 @@ func (c *Config) Validate() error {
 		if item.Statement != "" && item.Condition != "" {
 			return errConditionAndStatement
 		}
-		// String syntax with arguments like route(["pipes"]) leaves Pipelines as nil
-		// (to be extracted at router init). We detect this by checking if the statement
-		// starts with route([ (allowing whitespace). All other cases require explicit pipelines.
+		// When pipelines are empty, the configuration must still indicate how routing will happen:
+		// - String syntax: `route([...]) where ...` (pipelines derived from route(...))
+		// - Legacy syntax with default pipelines: `route() where ...` (pipelines omitted intentionally)
+		//
+		// Avoid loose substring matches: use the same prefix-based check as the router.
 		if len(item.Pipelines) == 0 {
-			// Check if this is string syntax with route arguments
 			trimmed := strings.TrimSpace(item.Statement)
-			// Look for route([... pattern, allowing whitespace: route( [
-			hasRouteArgs := strings.HasPrefix(trimmed, "route(") &&
-				strings.Contains(strings.SplitN(trimmed, ")", 2)[0], "[")
-			if !hasRouteArgs {
+			routePart := trimmed
+			if whereIdx := strings.Index(trimmed, " where "); whereIdx != -1 {
+				routePart = strings.TrimSpace(trimmed[:whereIdx])
+			}
+			if !strings.HasPrefix(routePart, "route(") {
 				return errNoPipelines
 			}
 		}

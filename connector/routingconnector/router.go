@@ -4,11 +4,15 @@
 package routingconnector // import "github.com/open-telemetry/opentelemetry-collector-contrib/connector/routingconnector"
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/pipeline"
 	"go.uber.org/zap"
 
@@ -30,6 +34,17 @@ var (
 // consumer for the given component ID(s).
 type consumerProvider[C any] func(...pipeline.ID) (C, error)
 
+// consumerRouter is a minimal interface for dynamic routing lookups.
+// It is satisfied by:
+// - connector.LogsRouterAndConsumer
+// - connector.TracesRouterAndConsumer
+// - connector.MetricsRouterAndConsumer
+//
+// This avoids storing the router as `any` and avoids per-signal type assertions.
+type consumerRouter[C any] interface {
+	Consumer(...pipeline.ID) (C, error)
+}
+
 // router registers consumers and default consumers for a pipeline. the type
 // parameter C is expected to be one of: consumer.Traces, consumer.Metrics, or
 // consumer.Logs.
@@ -40,6 +55,7 @@ type router[C any] struct {
 	settings         component.TelemetrySettings
 	routes           map[string]routingItem[C]
 	consumerProvider consumerProvider[C]
+	consumerRouter   consumerRouter[C]
 	table            []RoutingTableItem
 	routeSlice       []routingItem[C]
 }
@@ -50,6 +66,7 @@ func newRouter[C any](
 	table []RoutingTableItem,
 	defaultPipelineIDs []pipeline.ID,
 	provider consumerProvider[C],
+	consumerRouter consumerRouter[C],
 	settings component.TelemetrySettings,
 ) (*router[C], error) {
 	r := &router[C]{
@@ -58,6 +75,7 @@ func newRouter[C any](
 		table:            table,
 		routes:           make(map[string]routingItem[C]),
 		consumerProvider: provider,
+		consumerRouter:   consumerRouter,
 	}
 
 	if err := r.buildParsers(table, settings); err != nil {
@@ -69,17 +87,6 @@ func newRouter[C any](
 	}
 
 	return r, nil
-}
-
-type routingItem[C any] struct {
-	consumer           C
-	requestCondition   *requestCondition
-	resourceStatement  *ottl.Statement[*ottlresource.TransformContext]
-	spanStatement      *ottl.Statement[*ottlspan.TransformContext]
-	metricStatement    *ottl.Statement[*ottlmetric.TransformContext]
-	dataPointStatement *ottl.Statement[*ottldatapoint.TransformContext]
-	logStatement       *ottl.Statement[*ottllog.TransformContext]
-	statementContext   string
 }
 
 func (r *router[C]) buildParsers(_ []RoutingTableItem, settings component.TelemetrySettings) error {
@@ -110,6 +117,8 @@ func (r *router[C]) buildParsers(_ []RoutingTableItem, settings component.Teleme
 	// parsers to properly determine which context to use based on paths, functions, and enums.
 	// The one-time initialization cost is minimal compared to the complexity and fragility
 	// of trying to pre-determine which contexts are needed via statement inspection.
+	//
+	// Create parsers for the supported contexts and register them with a ParserCollection.
 	resourceParser, err := ottlresource.NewParser(
 		standardFunctions[*ottlresource.TransformContext](),
 		settings,
@@ -243,120 +252,72 @@ func (r *router[C]) normalizeConditions() {
 	}
 }
 
-// extractPipelinesFromStatement extracts pipeline IDs from string syntax using OTTL parsing.
-// This is used to parse route(["p1", "p2"]) where condition into pipeline IDs.
-func (r *router[C]) extractPipelinesFromStatement(statement string) ([]pipeline.ID, error) {
-	var capturedPipelines []string
+// registerRouteConsumers registers consumers for routes, detecting static vs dynamic routing
+func (r *router[C]) registerRouteConsumers() error {
+	// Accumulate errors following transform processor's pattern (processor.go:31-42)
+	var errs error
 
-	// Create temporary parser with capture
-	funcs := standardFunctionsWithCapture[*ottlresource.TransformContext](&capturedPipelines)
-	parser, err := ottlresource.NewParser(funcs, r.settings, ottlresource.EnablePathContextNames())
-	if err != nil {
-		return nil, err
+	classify := classifyDeps[C]{
+		tryEvaluateStatic: r.tryEvaluateStaticRoute,
+		consumerProvider:  r.consumerProvider,
 	}
-
-	// Parse to trigger capture
-	_, err = parser.ParseStatement(statement)
-	if err != nil {
-		return nil, err
-	}
-
-	// Convert captured strings to pipeline.ID
-	pipelines := make([]pipeline.ID, len(capturedPipelines))
-	for i, p := range capturedPipelines {
-		if err := pipelines[i].UnmarshalText([]byte(p)); err != nil {
-			return nil, fmt.Errorf("invalid pipeline %q: %w", p, err)
-		}
-	}
-
-	return pipelines, nil
-}
-
-// registerRouteConsumers registers a consumer for the pipelines configured for each route
-func (r *router[C]) registerRouteConsumers() (err error) {
-	for i := range r.table {
-		item := &r.table[i]
-
-		// Extract pipelines from string syntax if needed
-		if len(item.Pipelines) == 0 && strings.HasPrefix(item.Statement, "route([") {
-			pipelines, err := r.extractPipelinesFromStatement(item.Statement)
-			if err != nil {
-				return fmt.Errorf("invalid route syntax in table[%d]: %w", i, err)
-			}
-			item.Pipelines = pipelines
-		}
-	}
+	parse := parseDeps{parserCollection: r.parserCollection}
+	wire := wireDeps[C]{consumerProvider: r.consumerProvider}
 
 	for _, item := range r.table {
-		route, dupeFound := r.routes[key(item)]
-		if dupeFound {
-			var pipelineNames []string
-			for _, pipeline := range item.Pipelines {
-				pipelineNames = append(pipelineNames, pipeline.String())
-			}
-			exporters := strings.Join(pipelineNames, ", ")
-			r.logger.Warn(fmt.Sprintf(`Statement %q already exists in the routing table, the route with target pipeline(s) %q will be ignored.`, item.Statement, exporters))
-			// Without this continue, the duplicate's pipelines would overwrite the original
-			// route's consumer, contradicting the warning message above.
+		if r.checkDuplicateRoute(item) {
 			continue
 		}
 
-		route.statementContext = item.Context
+		route := newRoutingItem[C](item.Context)
+
+		var err error
 		if item.Context == "request" {
-			route.requestCondition, err = parseRequestCondition(item.Condition)
-			if err != nil {
-				return err
-			}
+			err = route.BuildRequest(item)
 		} else {
-			statementsGetter := ottl.NewStatementsGetter([]string{item.Statement})
-			var result any
-			if item.Context == "" {
-				// Context is empty, try to infer it
-				// Default to resource context if inference fails or ambiguous (though priorities handle ambiguity)
-				result, err = r.parserCollection.ParseStatements(statementsGetter, ottl.WithDefaultContext(ottlresource.ContextName))
-			} else {
-				// Context is explicit
-				result, err = r.parserCollection.ParseStatementsWithContext(item.Context, statementsGetter)
-			}
-
-			if err != nil {
-				return err
-			}
-
-			// singleStatementConverter returns the single parsed *ottl.Statement[K]
-			switch s := result.(type) {
-			case *ottl.Statement[*ottlresource.TransformContext]:
-				route.resourceStatement = s
-				route.statementContext = "resource"
-			case *ottl.Statement[*ottlspan.TransformContext]:
-				route.spanStatement = s
-				route.statementContext = "span"
-			case *ottl.Statement[*ottlmetric.TransformContext]:
-				route.metricStatement = s
-				route.statementContext = "metric"
-			case *ottl.Statement[*ottldatapoint.TransformContext]:
-				route.dataPointStatement = s
-				route.statementContext = "datapoint"
-			case *ottl.Statement[*ottllog.TransformContext]:
-				route.logStatement = s
-				route.statementContext = "log"
-			default:
-				return fmt.Errorf("unexpected statement type: %T", result)
+			if err = route.ParseStatement(parse, item); err == nil {
+				err = route.Classify(classify, item)
 			}
 		}
-
-		consumer, err := r.consumerProvider(item.Pipelines...)
 		if err != nil {
-			return fmt.Errorf("%w: %s", errPipelineNotFound, err.Error())
-		}
-		route.consumer = consumer
-		if !dupeFound {
-			r.routeSlice = append(r.routeSlice, route)
+			errs = errors.Join(errs, err)
+			continue
 		}
 
-		r.routes[key(item)] = route
+		if err = route.WireLegacyPipelinesConsumer(wire, item); err != nil {
+			errs = errors.Join(errs, err)
+			continue
+		}
+
+		r.addRoute(item, route)
 	}
-	return nil
+	return errs
+}
+
+// checkDuplicateRoute checks if a route already exists in the
+// routing table and logs a warning if it does.
+func (r *router[C]) checkDuplicateRoute(item RoutingTableItem) bool {
+	if _, ok := r.routes[key(item)]; !ok {
+		return false
+	}
+
+	var pipelineNames []string
+	for _, pipeline := range item.Pipelines {
+		pipelineNames = append(pipelineNames, pipeline.String())
+	}
+	exporters := strings.Join(pipelineNames, ", ")
+
+	r.logger.Warn(fmt.Sprintf(
+		`Statement %q already exists in the routing table, the route with target pipeline(s) %q will be ignored.`,
+		item.Statement,
+		exporters,
+	))
+	return true
+}
+
+func (r *router[C]) addRoute(item RoutingTableItem, route routingItem[C]) {
+	r.routeSlice = append(r.routeSlice, route)
+	r.routes[key(item)] = route
 }
 
 func key(entry RoutingTableItem) string {
@@ -367,5 +328,121 @@ func key(entry RoutingTableItem) string {
 		return "[request] " + entry.Condition
 	default:
 		return "[" + entry.Context + "] " + entry.Statement
+	}
+}
+
+// tryEvaluateStaticRoute attempts to evaluate a route expression with an empty context.
+// This follows the same pattern as OTTL's newListGetter
+// - If all route() arguments are literals, they return values with empty context
+// - If any argument is an expression, evaluation errors or returns empty
+//
+// The key insight from literal_getter.go:24 is that literal[K,T].Get() ignores context:
+//
+//	func (l *literal[K, T]) Get(context.Context, K) (T, error) { return l.value, nil }
+//
+// Parsers are reused from router.buildParsers following transform processor's pattern
+// to avoid creating new parsers for each route during initialization.
+func (r *router[C]) tryEvaluateStaticRoute(route routingItem[C], routeExpr string) ([]string, bool) {
+	ctx := context.Background()
+
+	// Parse the route() expression using the already-initialized ParserCollection, using an explicit context.
+	// Using ParseStatements (inference) here is unreliable because `route(...)` might not reference any paths.
+	statementsGetter := ottl.NewStatementsGetter([]string{routeExpr})
+
+	contextName := route.statementContext
+	if contextName == "" {
+		contextName = ottlresource.ContextName
+	}
+
+	parsed, err := r.parserCollection.ParseStatementsWithContext(contextName, statementsGetter)
+	if err != nil {
+		return nil, false
+	}
+
+	switch stmt := parsed.(type) {
+	case *ottl.Statement[*ottlresource.TransformContext]:
+		emptyResourceLogs := plog.NewResourceLogs()
+		tCtx := ottlresource.NewTransformContextPtr(emptyResourceLogs.Resource(), emptyResourceLogs)
+		defer tCtx.Close()
+
+		result, _, err := stmt.Execute(ctx, tCtx)
+		if err != nil {
+			return nil, false
+		}
+		if pipelineNames, ok := result.([]string); ok && len(pipelineNames) > 0 {
+			return pipelineNames, true
+		}
+		return nil, false
+
+	case *ottl.Statement[*ottllog.TransformContext]:
+		emptyResourceLogs := plog.NewResourceLogs()
+		emptyScopeLogs := emptyResourceLogs.ScopeLogs().AppendEmpty()
+		emptyLogRecord := emptyScopeLogs.LogRecords().AppendEmpty()
+		tCtx := ottllog.NewTransformContextPtr(emptyResourceLogs, emptyScopeLogs, emptyLogRecord)
+		defer tCtx.Close()
+
+		result, _, err := stmt.Execute(ctx, tCtx)
+		if err != nil {
+			return nil, false
+		}
+		if pipelineNames, ok := result.([]string); ok && len(pipelineNames) > 0 {
+			return pipelineNames, true
+		}
+		return nil, false
+
+	case *ottl.Statement[*ottlspan.TransformContext]:
+		emptyResourceSpans := ptrace.NewResourceSpans()
+		emptyScopeSpans := emptyResourceSpans.ScopeSpans().AppendEmpty()
+		emptySpan := emptyScopeSpans.Spans().AppendEmpty()
+		tCtx := ottlspan.NewTransformContextPtr(emptyResourceSpans, emptyScopeSpans, emptySpan)
+		defer tCtx.Close()
+
+		result, _, err := stmt.Execute(ctx, tCtx)
+		if err != nil {
+			return nil, false
+		}
+		if pipelineNames, ok := result.([]string); ok && len(pipelineNames) > 0 {
+			return pipelineNames, true
+		}
+		return nil, false
+
+	case *ottl.Statement[*ottlmetric.TransformContext]:
+		emptyResourceMetrics := pmetric.NewResourceMetrics()
+		emptyScopeMetrics := emptyResourceMetrics.ScopeMetrics().AppendEmpty()
+		emptyMetric := emptyScopeMetrics.Metrics().AppendEmpty()
+		tCtx := ottlmetric.NewTransformContextPtr(emptyResourceMetrics, emptyScopeMetrics, emptyMetric)
+		defer tCtx.Close()
+
+		result, _, err := stmt.Execute(ctx, tCtx)
+		if err != nil {
+			return nil, false
+		}
+		if pipelineNames, ok := result.([]string); ok && len(pipelineNames) > 0 {
+			return pipelineNames, true
+		}
+		return nil, false
+
+	case *ottl.Statement[*ottldatapoint.TransformContext]:
+		emptyResourceMetrics := pmetric.NewResourceMetrics()
+		emptyScopeMetrics := emptyResourceMetrics.ScopeMetrics().AppendEmpty()
+		emptyMetric := emptyScopeMetrics.Metrics().AppendEmpty()
+		emptyGauge := emptyMetric.SetEmptyGauge()
+		emptyDataPoint := emptyGauge.DataPoints().AppendEmpty()
+		tCtx := ottldatapoint.NewTransformContextPtr(emptyResourceMetrics, emptyScopeMetrics, emptyMetric, emptyDataPoint)
+		defer tCtx.Close()
+
+		result, _, err := stmt.Execute(ctx, tCtx)
+		if err != nil {
+			return nil, false
+		}
+		if pipelineNames, ok := result.([]string); ok && len(pipelineNames) > 0 {
+			return pipelineNames, true
+		}
+		return nil, false
+
+	default:
+		// Should never happen because ParserCollection is configured with a singleStatementConverter
+		// and only these contexts are registered, but be defensive.
+		return nil, false
 	}
 }

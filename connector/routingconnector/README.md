@@ -132,6 +132,70 @@ table:
   - route(["traces/prod"]) where resource.attributes["env"] == "prod"
 ```
 
+### Dynamic Routing
+
+The routing connector supports **dynamic routing** where pipeline names are computed at runtime using OTTL expressions. This enables routing decisions based on telemetry field values.
+
+**Format:** `route([expression1, expression2, ...]) where condition`
+
+- Pipeline names can be OTTL expressions that evaluate to strings
+- Expressions are evaluated per event at runtime
+- Use OTTL converter functions like `Concat()`, `ToLowerCase()`, etc.
+
+**Examples:**
+
+```yaml
+connectors:
+  routing:
+    default_pipelines: [logs/default]
+    error_mode: ignore  # Fall back to default on routing errors
+    table:
+      # Route to tenant-specific pipelines based on attribute
+      - route([Concat(["logs/tenant-", resource.attributes["tenant"]], "")]) where resource.attributes["tenant"] != nil
+      
+      # Route with case normalization
+      - route([Concat(["logs/", ToLowerCase(resource.attributes["ENV"])], "")]) where resource.attributes["ENV"] != nil
+      
+      # Multi-pipeline: dynamic primary + static backup
+      - route([Concat(["traces/", resource.attributes["service.name"]], ""), "traces/backup"]) where resource.attributes["service.name"] != nil
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [routing]
+    # Pre-wire all possible target pipelines
+    logs/tenant-acme:
+      receivers: [routing]
+      exporters: [loki/acme]
+    logs/tenant-globex:
+      receivers: [routing]
+      exporters: [loki/globex]
+    logs/default:
+      receivers: [routing]
+      exporters: [loki/default]
+```
+
+**Dynamic routing features:**
+- Pipeline names computed from telemetry attributes at runtime
+- Supports any OTTL converter function (Concat, ToLowerCase, Split, etc.)
+- Error handling via `error_mode`: routes to `default_pipelines` on failure
+- Can mix static literals and dynamic expressions in the same route
+- Only routes to pipelines that are pre-wired in the service configuration
+
+**Performance characteristics:**
+- **Static routes** (e.g., `route(["logs/prod"])`) use pre-wired consumers with zero runtime overhead
+- **Dynamic routes** (e.g., `route([Concat(...)])`) evaluate expressions and perform consumer lookup per event
+- The connector automatically detects and optimizes static vs dynamic routes
+
+**Important notes:**
+- All target pipelines must be declared in the `service.pipelines` section
+- Dynamic expressions are evaluated using the first matching record in the batch
+- If a dynamic expression evaluates to a non-existent pipeline, the behavior depends on `error_mode`:
+  - `propagate`: returns error, record is dropped
+  - `ignore`: logs warning, routes to `default_pipelines`
+  - `silent`: silently routes to `default_pipelines`
+
 ### Supported [OTTL] functions
 
 - [Standard OTTL Converter Functions](../../pkg/ottl/ottlfuncs/README.md#converters)
@@ -146,6 +210,7 @@ The full list of settings exposed for this connector are documented in [config.g
 - [metrics](./testdata/config/metrics.yaml)
 - [traces](./testdata/config/traces.yaml)
 - [string syntax](./testdata/config/string_syntax.yaml)
+- [dynamic routing](./testdata/config/dynamic_routing.yaml)
 
 ## Examples
 

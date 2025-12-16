@@ -169,11 +169,24 @@ func TestValidateConfig(t *testing.T) {
 			error: "invalid route: no condition or statement provided",
 		},
 		{
-			name: "no pipeline provided",
+			name: "no pipeline provided without route function",
 			config: &Config{
 				Table: []RoutingTableItem{
 					{
-						Statement: `route() where attributes["attr"] == "acme"`,
+						Statement: `set(attributes["test"], "value") where attributes["attr"] == "acme"`,
+					},
+				},
+			},
+			error: "invalid route: no pipelines defined",
+		},
+		{
+			name: "no pipeline provided with route substring later in statement",
+			config: &Config{
+				Table: []RoutingTableItem{
+					{
+						// This contains the substring `route(` but does not start with route(...).
+						// Validation should not accept this as string syntax.
+						Statement: `set(attributes["test"], "route(") where attributes["attr"] == "acme"`,
 					},
 				},
 			},

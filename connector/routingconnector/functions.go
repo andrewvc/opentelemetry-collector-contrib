@@ -11,35 +11,39 @@ import (
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/ottlfuncs"
 )
 
-// RouteArguments defines the optional arguments for the route() function.
-// When using string syntax like route(["pipeline1"]), the Pipelines field
-// is populated by OTTL's argument parsing. The arguments are not used at
-// runtime since pipelines are wired up separately during config loading.
+// RouteArguments defines the arguments for the route() function.
+// Pipelines can be string literals (e.g., "logs/prod") or OTTL expressions
+// (e.g., Concat(["logs/", attributes["tenant"]])) that evaluate to pipeline names at runtime.
+// The argument is optional - route() with no arguments is valid for backward compatibility.
 type RouteArguments[K any] struct {
-	Pipelines ottl.Optional[[]string] `ottlarg:"0"`
+	Pipelines ottl.Optional[[]ottl.StringLikeGetter[K]] `ottlarg:"0"`
 }
 
-func createRouteFunction[K any](ottl.FunctionContext, ottl.Arguments) (ottl.ExprFunc[K], error) {
-	return func(context.Context, K) (any, error) {
-		return true, nil
-	}, nil
-}
+func createRouteFunction[K any](_ ottl.FunctionContext, args ottl.Arguments) (ottl.ExprFunc[K], error) {
+	routeArgs, ok := args.(*RouteArguments[K])
+	if !ok {
+		return nil, nil
+	}
 
-// createRouteFunctionWithCapture creates a route function that captures pipelines via closure.
-// This is used during router initialization to extract pipeline names from string syntax.
-func createRouteFunctionWithCapture[K any](capture *[]string) func(ottl.FunctionContext, ottl.Arguments) (ottl.ExprFunc[K], error) {
-	return func(_ ottl.FunctionContext, args ottl.Arguments) (ottl.ExprFunc[K], error) {
-		if args != nil {
-			if routeArgs, ok := args.(*RouteArguments[K]); ok {
-				if !routeArgs.Pipelines.IsEmpty() {
-					*capture = routeArgs.Pipelines.Get()
-				}
+	return func(ctx context.Context, tCtx K) (any, error) {
+		// If no pipelines argument provided, return empty slice (legacy behavior)
+		if routeArgs.Pipelines.IsEmpty() {
+			return []string{}, nil
+		}
+
+		pipelineGetters := routeArgs.Pipelines.Get()
+		pipelines := make([]string, 0, len(pipelineGetters))
+		for _, pg := range pipelineGetters {
+			p, err := pg.Get(ctx, tCtx)
+			if err != nil {
+				return nil, err
+			}
+			if p != nil {
+				pipelines = append(pipelines, *p)
 			}
 		}
-		return func(context.Context, K) (any, error) {
-			return true, nil
-		}, nil
-	}
+		return pipelines, nil
+	}, nil
 }
 
 func standardFunctions[K any]() map[string]ottl.Factory[K] {
@@ -53,23 +57,6 @@ func standardFunctions[K any]() map[string]ottl.Factory[K] {
 	funcs[deleteMatchingKeys.Name()] = deleteMatchingKeys
 
 	route := ottl.NewFactory("route", &RouteArguments[K]{}, createRouteFunction[K])
-	funcs[route.Name()] = route
-
-	return funcs
-}
-
-// standardFunctionsWithCapture creates functions with pipeline capture for string syntax extraction.
-// Used during router initialization to extract pipeline names from route(["p1", "p2"]) syntax.
-func standardFunctionsWithCapture[K any](pipelineCapture *[]string) map[string]ottl.Factory[K] {
-	funcs := ottlfuncs.StandardConverters[K]()
-
-	deleteKey := ottlfuncs.NewDeleteKeyFactory[K]()
-	funcs[deleteKey.Name()] = deleteKey
-
-	deleteMatchingKeys := ottlfuncs.NewDeleteMatchingKeysFactory[K]()
-	funcs[deleteMatchingKeys.Name()] = deleteMatchingKeys
-
-	route := ottl.NewFactory("route", &RouteArguments[K]{}, createRouteFunctionWithCapture[K](pipelineCapture))
 	funcs[route.Name()] = route
 
 	return funcs
