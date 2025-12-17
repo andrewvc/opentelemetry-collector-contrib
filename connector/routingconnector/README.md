@@ -211,6 +211,8 @@ The full list of settings exposed for this connector are documented in [config.g
 - [traces](./testdata/config/traces.yaml)
 - [string syntax](./testdata/config/string_syntax.yaml)
 - [dynamic routing](./testdata/config/dynamic_routing.yaml)
+- [dynamic routing e2e (logs)](./testdata/config/dynamic_routing_e2e.yaml) - runnable config with telemetrygen commands
+- [dynamic routing e2e (traces)](./testdata/config/dynamic_routing_traces_e2e.yaml) - runnable config with telemetrygen commands
 
 ## Examples
 
