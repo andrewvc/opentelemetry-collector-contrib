@@ -1,0 +1,86 @@
+# End-to-end test configuration for dynamic routing with traces
+#
+# This config demonstrates dynamic routing for traces where pipeline names
+# are computed at runtime from telemetry attributes.
+#
+# To test:
+#   1. Build the collector: make otelcontribcol
+#   2. Run: ./bin/otelcontribcol_* --config connector/routingconnector/testdata/config/dynamic_routing_traces_e2e.yaml
+#   3. Send traces with different service names using telemetrygen:
+#
+#      # Route to traces/service-frontend (dynamic based on service.name)
+#      go run ./cmd/telemetrygen traces --otlp-insecure --traces 1 --service frontend
+#
+#      # Route to traces/service-backend (dynamic based on service.name)
+#      go run ./cmd/telemetrygen traces --otlp-insecure --traces 1 --service backend
+#
+#      # Route to traces/prod (static route based on env attribute)
+#      go run ./cmd/telemetrygen traces --otlp-insecure --traces 1 --otlp-attributes 'env="prod"'
+#
+#      # Route to default (no matching attributes)
+#      go run ./cmd/telemetrygen traces --otlp-insecure --traces 1 --service other --otlp-attributes 'env="dev"'
+#
+# Expected output: Each trace should appear in the debug exporter output with the
+# appropriate pipeline name prefix showing which route was taken.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: localhost:4317
+      http:
+        endpoint: localhost:4318
+
+exporters:
+  # Debug exporters for each target pipeline
+  debug/service-frontend:
+    verbosity: detailed
+  debug/service-backend:
+    verbosity: detailed
+  debug/prod:
+    verbosity: detailed
+  debug/default:
+    verbosity: detailed
+
+connectors:
+  routing:
+    default_pipelines: [traces/default]
+    error_mode: ignore  # Fall back to default on routing errors
+    table:
+      # Static route first - check for prod environment
+      # This demonstrates that static routes are evaluated first and are faster
+      - route(["traces/prod"]) where resource.attributes["env"] == "prod"
+      
+      # Dynamic routing: pipeline name computed from service.name attribute
+      # When service.name="frontend", routes to traces/service-frontend
+      # When service.name="backend", routes to traces/service-backend
+      - route([Concat(["traces/service-", resource.attributes["service.name"]], "")]) where resource.attributes["service.name"] == "frontend" or resource.attributes["service.name"] == "backend"
+
+service:
+  telemetry:
+    logs:
+      level: debug
+  pipelines:
+    # Input pipeline - receives from OTLP, routes via connector
+    traces/in:
+      receivers: [otlp]
+      exporters: [routing]
+    
+    # Dynamic target pipelines - must be pre-declared
+    traces/service-frontend:
+      receivers: [routing]
+      exporters: [debug/service-frontend]
+    traces/service-backend:
+      receivers: [routing]
+      exporters: [debug/service-backend]
+    
+    # Static route target
+    traces/prod:
+      receivers: [routing]
+      exporters: [debug/prod]
+    
+    # Default pipeline for unmatched traces
+    traces/default:
+      receivers: [routing]
+      exporters: [debug/default]
+

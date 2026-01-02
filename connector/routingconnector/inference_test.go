@@ -164,6 +164,7 @@ func TestMixedContextsInRoutingTable(t *testing.T) {
 	sink := new(consumertest.LogsSink)
 	router, err := newRouter(routeTable, nil,
 		func(...pipeline.ID) (consumer.Logs, error) { return sink, nil },
+		nil, // consumerRouter not needed for this test
 		componenttest.NewNopTelemetrySettings())
 	require.NoError(t, err)
 	require.Len(t, router.routeSlice, 3)
@@ -195,7 +196,7 @@ func TestDuplicateRouteIsIgnored(t *testing.T) {
 		return duplicateSink, nil
 	}
 
-	router, err := newRouter(routeTable, nil, consumerProvider, componenttest.NewNopTelemetrySettings())
+	router, err := newRouter(routeTable, nil, consumerProvider, nil, componenttest.NewNopTelemetrySettings())
 	require.NoError(t, err)
 
 	// Only one route should exist (duplicate was ignored)
@@ -219,6 +220,7 @@ var routerBuilders = map[pipeline.Signal]func([]RoutingTableItem) (string, int, 
 		sink := new(consumertest.LogsSink)
 		router, err := newRouter(routeTable, nil,
 			func(...pipeline.ID) (consumer.Logs, error) { return sink, nil },
+			nil, // consumerRouter not needed for this test
 			componenttest.NewNopTelemetrySettings())
 		if err != nil {
 			return "", 0, err
@@ -232,6 +234,7 @@ var routerBuilders = map[pipeline.Signal]func([]RoutingTableItem) (string, int, 
 		sink := new(consumertest.TracesSink)
 		router, err := newRouter(routeTable, nil,
 			func(...pipeline.ID) (consumer.Traces, error) { return sink, nil },
+			nil, // consumerRouter not needed for this test
 			componenttest.NewNopTelemetrySettings())
 		if err != nil {
 			return "", 0, err
@@ -245,6 +248,7 @@ var routerBuilders = map[pipeline.Signal]func([]RoutingTableItem) (string, int, 
 		sink := new(consumertest.MetricsSink)
 		router, err := newRouter(routeTable, nil,
 			func(...pipeline.ID) (consumer.Metrics, error) { return sink, nil },
+			nil, // consumerRouter not needed for this test
 			componenttest.NewNopTelemetrySettings())
 		if err != nil {
 			return "", 0, err

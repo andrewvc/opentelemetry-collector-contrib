@@ -1,0 +1,17 @@
+routing:
+  default_pipelines:
+    - logs/default
+  error_mode: ignore
+  table:
+    # Dynamic: pipeline name computed from tenant attribute
+    - route([Concat(["logs/tenant-", resource.attributes["tenant"]], "")]) where resource.attributes["tenant"] != nil
+    
+    # Dynamic: with case normalization using ToLowerCase
+    - route([Concat(["logs/", ToLowerCase(resource.attributes["ENV"])], "")]) where resource.attributes["ENV"] != nil
+    
+    # Mixed: dynamic primary pipeline + static backup pipeline
+    - route([Concat(["traces/", resource.attributes["service.name"]], ""), "traces/backup"]) where resource.attributes["service.name"] != nil
+    
+    # Static literal route for comparison (pre-wired at init time)
+    - route(["logs/static"]) where resource.attributes["static"] == true
+

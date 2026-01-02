@@ -84,6 +84,118 @@ This approach makes it immediately clear which attributes you're accessing witho
 - The `request` context requires use of the `condition` setting, and relies on a very limited grammar. Conditions must be in the form of `request["key"] == "value"` or `request["key"] != "value"`. (In the future, this grammar may be expanded to support more complex conditions.)
 - When using context inference without an explicit `context` field, the inferred context must be compatible with the pipeline signal type (e.g., `span` context can only be used in traces pipelines).
 
+### String Syntax
+
+The routing connector supports a concise string-based syntax for defining routing rules as an alternative to the map-based configuration. This syntax combines the pipeline list and routing condition into a single line:
+
+**Format:** `route(["pipeline1", "pipeline2"]) where condition`
+
+- `route([...])`: Specifies the target pipelines as a JSON array of strings
+- `where condition` (optional): Specifies the OTTL condition for routing
+
+**Examples:**
+
+```yaml
+connectors:
+  routing:
+    default_pipelines: [logs/other]
+    table:
+      # String syntax - concise and self-documenting
+      - route(["logs/acme"]) where request["X-Tenant"] == "acme"
+      - route(["logs/prod", "logs/backup"]) where resource.attributes["env"] == "prod"
+      
+      # Without a condition - routes all data to these pipelines
+      - route(["logs/default"])
+      
+      # You can mix string syntax with traditional map syntax
+      - condition: attributes["X-Tenant"] == "globex"
+        pipelines: [logs/globex]
+```
+
+**String syntax features:**
+- Pipeline lists are specified as JSON arrays: `["pipeline1", "pipeline2"]`
+- The `where` clause is optional if you want to route all data
+- Context is automatically inferred from the condition (e.g., `request[...]` → request context, `span.` → span context)
+- The syntax is validated at config load time
+- Fully compatible with the existing map-based syntax - use whichever is clearer for your use case
+
+**Equivalent configurations:**
+
+```yaml
+# Map syntax
+table:
+  - condition: resource.attributes["env"] == "prod"
+    pipelines: [traces/prod]
+
+# String syntax
+table:
+  - route(["traces/prod"]) where resource.attributes["env"] == "prod"
+```
+
+### Dynamic Routing
+
+The routing connector supports **dynamic routing** where pipeline names are computed at runtime using OTTL expressions. This enables routing decisions based on telemetry field values.
+
+**Format:** `route([expression1, expression2, ...]) where condition`
+
+- Pipeline names can be OTTL expressions that evaluate to strings
+- Expressions are evaluated per event at runtime
+- Use OTTL converter functions like `Concat()`, `ToLowerCase()`, etc.
+
+**Examples:**
+
+```yaml
+connectors:
+  routing:
+    default_pipelines: [logs/default]
+    error_mode: ignore  # Fall back to default on routing errors
+    table:
+      # Route to tenant-specific pipelines based on attribute
+      - route([Concat(["logs/tenant-", resource.attributes["tenant"]], "")]) where resource.attributes["tenant"] != nil
+      
+      # Route with case normalization
+      - route([Concat(["logs/", ToLowerCase(resource.attributes["ENV"])], "")]) where resource.attributes["ENV"] != nil
+      
+      # Multi-pipeline: dynamic primary + static backup
+      - route([Concat(["traces/", resource.attributes["service.name"]], ""), "traces/backup"]) where resource.attributes["service.name"] != nil
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [routing]
+    # Pre-wire all possible target pipelines
+    logs/tenant-acme:
+      receivers: [routing]
+      exporters: [loki/acme]
+    logs/tenant-globex:
+      receivers: [routing]
+      exporters: [loki/globex]
+    logs/default:
+      receivers: [routing]
+      exporters: [loki/default]
+```
+
+**Dynamic routing features:**
+- Pipeline names computed from telemetry attributes at runtime
+- Supports any OTTL converter function (Concat, ToLowerCase, Split, etc.)
+- Error handling via `error_mode`: routes to `default_pipelines` on failure
+- Can mix static literals and dynamic expressions in the same route
+- Only routes to pipelines that are pre-wired in the service configuration
+
+**Performance characteristics:**
+- **Static routes** (e.g., `route(["logs/prod"])`) use pre-wired consumers with zero runtime overhead
+- **Dynamic routes** (e.g., `route([Concat(...)])`) evaluate expressions and perform consumer lookup per event
+- The connector automatically detects and optimizes static vs dynamic routes
+
+**Important notes:**
+- All target pipelines must be declared in the `service.pipelines` section
+- Dynamic expressions are evaluated using the first matching record in the batch
+- If a dynamic expression evaluates to a non-existent pipeline, the behavior depends on `error_mode`:
+  - `propagate`: returns error, record is dropped
+  - `ignore`: logs warning, routes to `default_pipelines`
+  - `silent`: silently routes to `default_pipelines`
+
 ### Supported [OTTL] functions
 
 - [Standard OTTL Converter Functions](../../pkg/ottl/ottlfuncs/README.md#converters)
@@ -97,6 +209,10 @@ The full list of settings exposed for this connector are documented in [config.g
 - [logs](./testdata/config/logs.yaml)
 - [metrics](./testdata/config/metrics.yaml)
 - [traces](./testdata/config/traces.yaml)
+- [string syntax](./testdata/config/string_syntax.yaml)
+- [dynamic routing](./testdata/config/dynamic_routing.yaml)
+- [dynamic routing e2e (logs)](./testdata/config/dynamic_routing_e2e.yaml) - runnable config with telemetrygen commands
+- [dynamic routing e2e (traces)](./testdata/config/dynamic_routing_traces_e2e.yaml) - runnable config with telemetrygen commands
 
 ## Examples
 

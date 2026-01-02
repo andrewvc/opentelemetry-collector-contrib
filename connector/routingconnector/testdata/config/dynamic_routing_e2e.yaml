@@ -1,0 +1,85 @@
+# End-to-end test configuration for dynamic routing
+#
+# This config demonstrates dynamic routing where pipeline names are computed
+# at runtime from telemetry attributes.
+#
+# To test:
+#   1. Build the collector: make otelcontribcol
+#   2. Run: ./bin/otelcontribcol_* --config connector/routingconnector/testdata/config/dynamic_routing_e2e.yaml
+#   3. Send logs with different tenant attributes using telemetrygen:
+#
+#      # Route to logs/tenant-acme (dynamic)
+#      go run ./cmd/telemetrygen logs --otlp-insecure --logs 1 --otlp-attributes 'tenant="acme"'
+#
+#      # Route to logs/tenant-globex (dynamic)
+#      go run ./cmd/telemetrygen logs --otlp-insecure --logs 1 --otlp-attributes 'tenant="globex"'
+#
+#      # Route to default (no tenant attribute)
+#      go run ./cmd/telemetrygen logs --otlp-insecure --logs 1
+#
+#      # Static route test
+#      go run ./cmd/telemetrygen logs --otlp-insecure --logs 1 --otlp-attributes 'static="true"'
+#
+# Expected output: Each log should appear in the debug exporter output with the
+# appropriate pipeline name prefix showing which route was taken.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: localhost:4317
+      http:
+        endpoint: localhost:4318
+
+exporters:
+  # Debug exporters for each target pipeline
+  debug/tenant-acme:
+    verbosity: detailed
+  debug/tenant-globex:
+    verbosity: detailed
+  debug/static:
+    verbosity: detailed
+  debug/default:
+    verbosity: detailed
+
+connectors:
+  routing:
+    default_pipelines: [logs/default]
+    error_mode: ignore  # Fall back to default on routing errors
+    table:
+      # Dynamic routing: pipeline name computed from tenant attribute
+      # When tenant="acme", routes to logs/tenant-acme
+      # When tenant="globex", routes to logs/tenant-globex
+      - route([Concat(["logs/tenant-", resource.attributes["tenant"]], "")]) where resource.attributes["tenant"] != nil
+      
+      # Static route for comparison - uses pre-wired consumer (fast path)
+      - route(["logs/static"]) where resource.attributes["static"] == "true"
+
+service:
+  telemetry:
+    logs:
+      level: debug
+  pipelines:
+    # Input pipeline - receives from OTLP, routes via connector
+    logs/in:
+      receivers: [otlp]
+      exporters: [routing]
+    
+    # Dynamic target pipelines - must be pre-declared even though routing is dynamic
+    logs/tenant-acme:
+      receivers: [routing]
+      exporters: [debug/tenant-acme]
+    logs/tenant-globex:
+      receivers: [routing]
+      exporters: [debug/tenant-globex]
+    
+    # Static route target
+    logs/static:
+      receivers: [routing]
+      exporters: [debug/static]
+    
+    # Default pipeline for unmatched logs
+    logs/default:
+      receivers: [routing]
+      exporters: [debug/default]
+

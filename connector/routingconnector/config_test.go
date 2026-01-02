@@ -99,6 +99,36 @@ func TestLoadConfig(t *testing.T) {
 				},
 			},
 		},
+		{
+			configPath: filepath.Join("testdata", "config", "string_syntax.yaml"),
+			id:         component.NewIDWithName(metadata.Type, ""),
+			expected: &Config{
+				DefaultPipelines: []pipeline.ID{
+					pipeline.NewIDWithName(pipeline.SignalTraces, "other"),
+				},
+				ErrorMode: ottl.PropagateError,
+				Table: []RoutingTableItem{
+					{
+						Statement: `route(["traces/acme"]) where attributes["X-Tenant"] == "acme"`,
+						Pipelines: nil, // Pipelines extracted at router init
+					},
+					{
+						Statement: `route(["traces/prod", "traces/backup"]) where resource.attributes["env"] == "prod"`,
+						Pipelines: nil, // Pipelines extracted at router init
+					},
+					{
+						Statement: `route(["traces/default"])`,
+						Pipelines: nil, // Pipelines extracted at router init
+					},
+					{
+						Statement: `route() where attributes["X-Tenant"] == "globex"`,
+						Pipelines: []pipeline.ID{
+							pipeline.NewIDWithName(pipeline.SignalTraces, "globex"),
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range testcases {
@@ -139,11 +169,24 @@ func TestValidateConfig(t *testing.T) {
 			error: "invalid route: no condition or statement provided",
 		},
 		{
-			name: "no pipeline provided",
+			name: "no pipeline provided without route function",
 			config: &Config{
 				Table: []RoutingTableItem{
 					{
-						Statement: `route() where attributes["attr"] == "acme"`,
+						Statement: `set(attributes["test"], "value") where attributes["attr"] == "acme"`,
+					},
+				},
+			},
+			error: "invalid route: no pipelines defined",
+		},
+		{
+			name: "no pipeline provided with route substring later in statement",
+			config: &Config{
+				Table: []RoutingTableItem{
+					{
+						// This contains the substring `route(` but does not start with route(...).
+						// Validation should not accept this as string syntax.
+						Statement: `set(attributes["test"], "route(") where attributes["attr"] == "acme"`,
 					},
 				},
 			},

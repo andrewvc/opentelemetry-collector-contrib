@@ -1102,3 +1102,383 @@ func setLogRecordMap(lr plog.LogRecord, key, value string) plog.LogRecord {
 	lr.Body().SetEmptyMap().PutStr(key, value)
 	return lr
 }
+
+func TestLogsDynamicRoutingWithConcat(t *testing.T) {
+	// Test dynamic routing where pipeline name is computed from attributes
+	logsDefault := pipeline.NewIDWithName(pipeline.SignalLogs, "default")
+	logsAcme := pipeline.NewIDWithName(pipeline.SignalLogs, "tenant-acme")
+	logsGlobex := pipeline.NewIDWithName(pipeline.SignalLogs, "tenant-globex")
+
+	cfg := &Config{
+		DefaultPipelines: []pipeline.ID{logsDefault},
+		ErrorMode:        ottl.IgnoreError,
+		Table: []RoutingTableItem{
+			{
+				// Dynamic routing: pipeline name computed from tenant attribute
+				Statement: `route([Concat(["logs/tenant-", resource.attributes["tenant"]], "")]) where resource.attributes["tenant"] != nil`,
+			},
+		},
+	}
+	require.NoError(t, cfg.Validate())
+
+	var defaultSink, acmeSink, globexSink consumertest.LogsSink
+	router := connector.NewLogsRouter(map[pipeline.ID]consumer.Logs{
+		logsDefault: &defaultSink,
+		logsAcme:    &acmeSink,
+		logsGlobex:  &globexSink,
+	})
+
+	conn, err := NewFactory().CreateLogsToLogs(
+		t.Context(),
+		connectortest.NewNopSettings(metadata.Type),
+		cfg,
+		router.(consumer.Logs),
+	)
+	require.NoError(t, err)
+
+	// Create logs with different tenant attributes
+	logsWithTenant := func(tenant string) plog.Logs {
+		logs := plog.NewLogs()
+		rl := logs.ResourceLogs().AppendEmpty()
+		rl.Resource().Attributes().PutStr("tenant", tenant)
+		rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("test log")
+		return logs
+	}
+
+	// Test routing to acme tenant
+	require.NoError(t, conn.ConsumeLogs(t.Context(), logsWithTenant("acme")))
+	assert.Equal(t, 1, acmeSink.LogRecordCount(), "acme sink should receive logs")
+	assert.Equal(t, 0, globexSink.LogRecordCount(), "globex sink should be empty")
+	assert.Equal(t, 0, defaultSink.LogRecordCount(), "default sink should be empty")
+
+	// Reset and test routing to globex tenant
+	acmeSink.Reset()
+	require.NoError(t, conn.ConsumeLogs(t.Context(), logsWithTenant("globex")))
+	assert.Equal(t, 0, acmeSink.LogRecordCount(), "acme sink should be empty")
+	assert.Equal(t, 1, globexSink.LogRecordCount(), "globex sink should receive logs")
+	assert.Equal(t, 0, defaultSink.LogRecordCount(), "default sink should be empty")
+
+	// Test logs without tenant attribute go to default
+	globexSink.Reset()
+	logsNoTenant := plog.NewLogs()
+	logsNoTenant.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	require.NoError(t, conn.ConsumeLogs(t.Context(), logsNoTenant))
+	assert.Equal(t, 0, acmeSink.LogRecordCount(), "acme sink should be empty")
+	assert.Equal(t, 0, globexSink.LogRecordCount(), "globex sink should be empty")
+	assert.Equal(t, 1, defaultSink.LogRecordCount(), "default sink should receive unmatched logs")
+}
+
+func TestLogsDynamicRoutingWithToLower(t *testing.T) {
+	// Test dynamic routing with case normalization
+	logsDefault := pipeline.NewIDWithName(pipeline.SignalLogs, "default")
+	logsProd := pipeline.NewIDWithName(pipeline.SignalLogs, "prod")
+	logsStaging := pipeline.NewIDWithName(pipeline.SignalLogs, "staging")
+
+	cfg := &Config{
+		DefaultPipelines: []pipeline.ID{logsDefault},
+		ErrorMode:        ottl.IgnoreError,
+		Table: []RoutingTableItem{
+			{
+				// Dynamic routing with case normalization (using ToLowerCase)
+				Statement: `route([Concat(["logs/", ToLowerCase(resource.attributes["ENV"])], "")]) where resource.attributes["ENV"] != nil`,
+			},
+		},
+	}
+	require.NoError(t, cfg.Validate())
+
+	var defaultSink, prodSink, stagingSink consumertest.LogsSink
+	router := connector.NewLogsRouter(map[pipeline.ID]consumer.Logs{
+		logsDefault: &defaultSink,
+		logsProd:    &prodSink,
+		logsStaging: &stagingSink,
+	})
+
+	conn, err := NewFactory().CreateLogsToLogs(
+		t.Context(),
+		connectortest.NewNopSettings(metadata.Type),
+		cfg,
+		router.(consumer.Logs),
+	)
+	require.NoError(t, err)
+
+	// Create logs with ENV attribute
+	logsWithEnv := func(env string) plog.Logs {
+		logs := plog.NewLogs()
+		rl := logs.ResourceLogs().AppendEmpty()
+		rl.Resource().Attributes().PutStr("ENV", env)
+		rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("test log")
+		return logs
+	}
+
+	// Test with uppercase ENV="PROD" - should route to logs/prod
+	require.NoError(t, conn.ConsumeLogs(t.Context(), logsWithEnv("PROD")))
+	assert.Equal(t, 1, prodSink.LogRecordCount(), "prod sink should receive logs")
+	assert.Equal(t, 0, stagingSink.LogRecordCount())
+	assert.Equal(t, 0, defaultSink.LogRecordCount())
+
+	// Test with mixed case ENV="Staging" - should route to logs/staging
+	prodSink.Reset()
+	require.NoError(t, conn.ConsumeLogs(t.Context(), logsWithEnv("Staging")))
+	assert.Equal(t, 0, prodSink.LogRecordCount())
+	assert.Equal(t, 1, stagingSink.LogRecordCount(), "staging sink should receive logs")
+	assert.Equal(t, 0, defaultSink.LogRecordCount())
+}
+
+func TestLogsDynamicRoutingErrorHandling(t *testing.T) {
+	// Test error handling when dynamic routing evaluates to non-existent pipeline
+	logsDefault := pipeline.NewIDWithName(pipeline.SignalLogs, "default")
+	logsAcme := pipeline.NewIDWithName(pipeline.SignalLogs, "tenant-acme")
+
+	cfg := &Config{
+		DefaultPipelines: []pipeline.ID{logsDefault},
+		ErrorMode:        ottl.IgnoreError,
+		Table: []RoutingTableItem{
+			{
+				// Dynamic routing that might evaluate to non-existent pipeline
+				Statement: `route([Concat(["logs/tenant-", resource.attributes["tenant"]], "")]) where resource.attributes["tenant"] != nil`,
+			},
+		},
+	}
+	require.NoError(t, cfg.Validate())
+
+	var defaultSink, acmeSink consumertest.LogsSink
+	// Only register acme pipeline, not globex
+	router := connector.NewLogsRouter(map[pipeline.ID]consumer.Logs{
+		logsDefault: &defaultSink,
+		logsAcme:    &acmeSink,
+	})
+
+	conn, err := NewFactory().CreateLogsToLogs(
+		t.Context(),
+		connectortest.NewNopSettings(metadata.Type),
+		cfg,
+		router.(consumer.Logs),
+	)
+	require.NoError(t, err)
+
+	logsWithTenant := func(tenant string) plog.Logs {
+		logs := plog.NewLogs()
+		rl := logs.ResourceLogs().AppendEmpty()
+		rl.Resource().Attributes().PutStr("tenant", tenant)
+		rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("test log")
+		return logs
+	}
+
+	// Valid pipeline - should work
+	require.NoError(t, conn.ConsumeLogs(t.Context(), logsWithTenant("acme")))
+	assert.Equal(t, 1, acmeSink.LogRecordCount())
+	assert.Equal(t, 0, defaultSink.LogRecordCount())
+
+	// Non-existent pipeline - should fall back to default (error_mode=ignore)
+	acmeSink.Reset()
+	require.NoError(t, conn.ConsumeLogs(t.Context(), logsWithTenant("globex")))
+	assert.Equal(t, 0, acmeSink.LogRecordCount())
+	assert.Equal(t, 1, defaultSink.LogRecordCount(), "should fall back to default on error")
+}
+
+func TestLogsMixedStaticAndDynamicRouting(t *testing.T) {
+	// Test that static and dynamic routes can coexist
+	logsDefault := pipeline.NewIDWithName(pipeline.SignalLogs, "default")
+	logsProd := pipeline.NewIDWithName(pipeline.SignalLogs, "prod")
+	logsAcme := pipeline.NewIDWithName(pipeline.SignalLogs, "tenant-acme")
+
+	cfg := &Config{
+		DefaultPipelines: []pipeline.ID{logsDefault},
+		ErrorMode:        ottl.IgnoreError,
+		Table: []RoutingTableItem{
+			{
+				// Static route - should use fast path
+				Statement: `route(["logs/prod"]) where resource.attributes["env"] == "prod"`,
+			},
+			{
+				// Dynamic route - evaluated at runtime
+				Statement: `route([Concat(["logs/tenant-", resource.attributes["tenant"]], "")]) where resource.attributes["tenant"] != nil`,
+			},
+		},
+	}
+	require.NoError(t, cfg.Validate())
+
+	var defaultSink, prodSink, acmeSink consumertest.LogsSink
+	router := connector.NewLogsRouter(map[pipeline.ID]consumer.Logs{
+		logsDefault: &defaultSink,
+		logsProd:    &prodSink,
+		logsAcme:    &acmeSink,
+	})
+
+	conn, err := NewFactory().CreateLogsToLogs(
+		t.Context(),
+		connectortest.NewNopSettings(metadata.Type),
+		cfg,
+		router.(consumer.Logs),
+	)
+	require.NoError(t, err)
+
+	// Test static route
+	logsProdEnv := plog.NewLogs()
+	rl := logsProdEnv.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("env", "prod")
+	rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("prod log")
+	require.NoError(t, conn.ConsumeLogs(t.Context(), logsProdEnv))
+	assert.Equal(t, 1, prodSink.LogRecordCount(), "static route should work")
+	assert.Equal(t, 0, acmeSink.LogRecordCount())
+	assert.Equal(t, 0, defaultSink.LogRecordCount())
+
+	// Test dynamic route
+	prodSink.Reset()
+	logsAcmeTenant := plog.NewLogs()
+	rl = logsAcmeTenant.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("tenant", "acme")
+	rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("acme log")
+	require.NoError(t, conn.ConsumeLogs(t.Context(), logsAcmeTenant))
+	assert.Equal(t, 0, prodSink.LogRecordCount())
+	assert.Equal(t, 1, acmeSink.LogRecordCount(), "dynamic route should work")
+	assert.Equal(t, 0, defaultSink.LogRecordCount())
+}
+
+func TestLogsStaticRouteDetection(t *testing.T) {
+	// Test that static literal routes are detected correctly and pre-wired
+	logsDefault := pipeline.NewIDWithName(pipeline.SignalLogs, "default")
+	logsProd := pipeline.NewIDWithName(pipeline.SignalLogs, "prod")
+
+	cfg := &Config{
+		DefaultPipelines: []pipeline.ID{logsDefault},
+		Table: []RoutingTableItem{
+			{
+				// Static route with literal pipeline names
+				Statement: `route(["logs/prod"]) where resource.attributes["env"] == "prod"`,
+			},
+		},
+	}
+
+	var defaultSink, prodSink consumertest.LogsSink
+	router := connector.NewLogsRouter(map[pipeline.ID]consumer.Logs{
+		logsDefault: &defaultSink,
+		logsProd:    &prodSink,
+	})
+
+	conn, err := NewFactory().CreateLogsToLogs(
+		t.Context(),
+		connectortest.NewNopSettings(metadata.Type),
+		cfg,
+		router.(consumer.Logs),
+	)
+	require.NoError(t, err)
+
+	// Verify the route was detected as static and pre-wired
+	logsConn := conn.(*logsConnector)
+	require.Len(t, logsConn.router.routeSlice, 1)
+	route := logsConn.router.routeSlice[0]
+	assert.False(t, route.isDynamic, "static literal route should have isDynamic=false")
+	assert.NotNil(t, route.consumer, "static literal route should have pre-wired consumer")
+}
+
+func TestLogsDynamicRouteDetection(t *testing.T) {
+	// Test that dynamic expression routes are detected correctly and consumer is nil
+	logsDefault := pipeline.NewIDWithName(pipeline.SignalLogs, "default")
+	logsAcme := pipeline.NewIDWithName(pipeline.SignalLogs, "tenant-acme")
+
+	cfg := &Config{
+		DefaultPipelines: []pipeline.ID{logsDefault},
+		ErrorMode:        ottl.IgnoreError,
+		Table: []RoutingTableItem{
+			{
+				// Dynamic route with Concat expression
+				Statement: `route([Concat(["logs/tenant-", resource.attributes["tenant"]], "")]) where resource.attributes["tenant"] != nil`,
+			},
+		},
+	}
+
+	var defaultSink, acmeSink consumertest.LogsSink
+	router := connector.NewLogsRouter(map[pipeline.ID]consumer.Logs{
+		logsDefault: &defaultSink,
+		logsAcme:    &acmeSink,
+	})
+
+	conn, err := NewFactory().CreateLogsToLogs(
+		t.Context(),
+		connectortest.NewNopSettings(metadata.Type),
+		cfg,
+		router.(consumer.Logs),
+	)
+	require.NoError(t, err)
+
+	// Verify the route was detected as dynamic and consumer is nil
+	logsConn := conn.(*logsConnector)
+	require.Len(t, logsConn.router.routeSlice, 1)
+	route := logsConn.router.routeSlice[0]
+	assert.True(t, route.isDynamic, "dynamic expression route should have isDynamic=true")
+	assert.Nil(t, route.consumer, "dynamic expression route should have nil consumer (resolved at runtime)")
+}
+
+func TestLogsPrefixCheckCorrectness(t *testing.T) {
+	// Test that route( prefix check works correctly
+	logsDefault := pipeline.NewIDWithName(pipeline.SignalLogs, "default")
+	logsProd := pipeline.NewIDWithName(pipeline.SignalLogs, "prod")
+
+	testCases := []struct {
+		name            string
+		statement       string
+		expectDynamic   bool
+		expectPrewired  bool
+		description     string
+	}{
+		{
+			name:           "route( prefix with literals",
+			statement:      `route(["logs/prod"]) where resource.attributes["env"] == "prod"`,
+			expectDynamic:  false,
+			expectPrewired: true,
+			description:    "Should detect as static and pre-wire",
+		},
+		{
+			name:           "route( prefix with whitespace",
+			statement:      `  route(["logs/prod"]) where resource.attributes["env"] == "prod"`,
+			expectDynamic:  false,
+			expectPrewired: true,
+			description:    "Should trim whitespace and detect as static",
+		},
+		{
+			name:           "legacy syntax without route(",
+			statement:      `route() where resource.attributes["env"] == "prod"`,
+			expectDynamic:  false,
+			expectPrewired: false,
+			description:    "Legacy syntax should not trigger prefix check",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{
+				DefaultPipelines: []pipeline.ID{logsDefault},
+				Table: []RoutingTableItem{
+					{
+						Statement: tc.statement,
+						Pipelines: []pipeline.ID{logsProd}, // For legacy syntax
+					},
+				},
+			}
+
+			var defaultSink, prodSink consumertest.LogsSink
+			router := connector.NewLogsRouter(map[pipeline.ID]consumer.Logs{
+				logsDefault: &defaultSink,
+				logsProd:    &prodSink,
+			})
+
+			conn, err := NewFactory().CreateLogsToLogs(
+				t.Context(),
+				connectortest.NewNopSettings(metadata.Type),
+				cfg,
+				router.(consumer.Logs),
+			)
+			require.NoError(t, err, tc.description)
+
+			logsConn := conn.(*logsConnector)
+			require.Len(t, logsConn.router.routeSlice, 1, tc.description)
+			route := logsConn.router.routeSlice[0]
+			
+			assert.Equal(t, tc.expectDynamic, route.isDynamic, tc.description)
+			if tc.expectPrewired {
+				assert.NotNil(t, route.consumer, tc.description)
+			}
+		})
+	}
+}

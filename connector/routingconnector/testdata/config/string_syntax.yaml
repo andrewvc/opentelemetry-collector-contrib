@@ -1,0 +1,14 @@
+routing:
+  default_pipelines:
+    - traces/other
+  table:
+    # String syntax with single pipeline
+    - route(["traces/acme"]) where attributes["X-Tenant"] == "acme"
+    # String syntax with multiple pipelines
+    - route(["traces/prod", "traces/backup"]) where resource.attributes["env"] == "prod"
+    # String syntax without condition
+    - route(["traces/default"])
+    # Mixed with traditional map syntax
+    - statement: route() where attributes["X-Tenant"] == "globex"
+      pipelines:
+        - traces/globex
